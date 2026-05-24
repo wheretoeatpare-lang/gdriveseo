@@ -2,9 +2,8 @@ import os
 import json
 import datetime
 import requests
+import time
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-import google.auth
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -14,11 +13,46 @@ from googleapiclient.discovery import build
 
 CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 SPREADSHEET_ID   = os.environ["SPREADSHEET_ID"]
-WEBSITES_RAW     = os.environ["WEBSITES"]  # comma-separated URLs
+WEBSITES_RAW     = os.environ["WEBSITES"]
+GROQ_API_KEY     = os.environ["GROQ_API_KEY"]
 
 WEBSITES = [url.strip() for url in WEBSITES_RAW.split(",") if url.strip()]
+SCOPES   = ["https://www.googleapis.com/auth/spreadsheets"]
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+GROQ_MODEL   = "llama-3.3-70b-versatile"
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+SEO_EXPERT_SYSTEM_PROMPT = """You are Rex Morgan, a battle-hardened SEO expert with 15 years of experience.
+You have personally ranked hundreds of websites to #1 on Google — from small local businesses to Fortune 500 companies.
+You live and breathe Google's algorithm updates: from Panda, Penguin, Hummingbird, BERT, MUM, to the latest 2024-2025 Helpful Content, Core Updates, and E-E-A-T signals.
+
+Your job is to analyze a webpage's raw SEO data and deliver a sharp, actionable expert analysis.
+
+RULES:
+- Be direct, specific, and expert-level. No fluff.
+- Always reference the LATEST Google algorithm signals (E-E-A-T, Helpful Content, Core Web Vitals, Semantic SEO, entity authority, topical depth).
+- For every problem you find, explain WHY Google penalizes or ignores it based on current algorithm behavior.
+- Give a concrete improved version for titles and meta descriptions when they are suboptimal.
+- Prioritize issues by impact: HIGH / MEDIUM / LOW.
+- Be the expert that gets sites to #1. Talk like someone who has done it 100 times.
+- Keep each section tight — no filler words.
+
+Respond ONLY in this exact JSON format, no markdown, no extra text:
+{
+  "expert_summary": "2-3 sentence overall verdict from the SEO expert",
+  "title_suggestion": "improved title tag text here, or 'GOOD - no change needed'",
+  "meta_suggestion": "improved meta description here, or 'GOOD - no change needed'",
+  "top_issues": [
+    {"priority": "HIGH|MEDIUM|LOW", "issue": "issue name", "reason": "why Google cares about this in 2024-2025", "fix": "exact fix to implement"},
+    {"priority": "HIGH|MEDIUM|LOW", "issue": "issue name", "reason": "why Google cares about this in 2024-2025", "fix": "exact fix to implement"},
+    {"priority": "HIGH|MEDIUM|LOW", "issue": "issue name", "reason": "why Google cares about this in 2024-2025", "fix": "exact fix to implement"}
+  ],
+  "quick_wins": "1-2 sentence list of the fastest things to fix this week for immediate ranking boost",
+  "ai_score": 0
+}
+
+The ai_score is your expert score out of 100 based on overall SEO health."""
+
 
 # ─────────────────────────────────────────────
 # GOOGLE SHEETS AUTH
@@ -33,20 +67,16 @@ def get_sheets_service():
 
 
 # ─────────────────────────────────────────────
-# SEO AUDIT LOGIC
+# PAGE FETCHER
 # ─────────────────────────────────────────────
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (compatible; SEOAuditBot/1.0; +https://github.com)"
-    )
+FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; SEOAuditBot/1.0; +https://github.com)"
 }
 
-
 def fetch_page(url: str):
-    """Fetch a page and return (response, BeautifulSoup) or (None, None)."""
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = requests.get(url, headers=FETCH_HEADERS, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "lxml")
         return resp, soup
@@ -55,129 +85,219 @@ def fetch_page(url: str):
         return None, None
 
 
-def audit_page(url: str) -> dict:
-    """Run basic SEO checks on a single URL."""
-    result = {
+# ─────────────────────────────────────────────
+# BASIC SEO SCRAPER
+# ─────────────────────────────────────────────
+
+def scrape_seo_data(url: str) -> dict:
+    data = {
         "url": url,
         "status_code": "ERROR",
-        "title": "",
-        "title_length": 0,
-        "title_issue": "",
-        "meta_description": "",
-        "meta_desc_length": 0,
-        "meta_desc_issue": "",
-        "h1_count": 0,
-        "h1_text": "",
-        "h1_issue": "",
-        "h2_count": 0,
-        "images_total": 0,
-        "images_missing_alt": 0,
-        "images_issue": "",
-        "canonical": "",
-        "canonical_issue": "",
+        "title": "", "title_length": 0, "title_issue": "",
+        "meta_description": "", "meta_desc_length": 0, "meta_desc_issue": "",
+        "h1_count": 0, "h1_text": "", "h1_issue": "",
+        "h2_count": 0, "h2_texts": "",
+        "images_total": 0, "images_missing_alt": 0, "images_issue": "",
+        "canonical": "", "canonical_issue": "",
         "robots_meta": "",
         "open_graph": "",
-        "overall_score": 0,
-        "notes": "",
+        "page_text_snippet": "",
+        "internal_links": 0,
+        "external_links": 0,
+        "word_count": 0,
+        "schema_markup": "",
+        "base_score": 0,
     }
 
     resp, soup = fetch_page(url)
     if resp is None:
-        result["notes"] = "Page could not be fetched"
-        return result
+        return data
 
-    result["status_code"] = resp.status_code
+    data["status_code"] = resp.status_code
 
-    # ── TITLE ──────────────────────────────
+    # TITLE
     title_tag = soup.find("title")
     title = title_tag.get_text(strip=True) if title_tag else ""
-    result["title"] = title
-    result["title_length"] = len(title)
+    data["title"] = title
+    data["title_length"] = len(title)
     if not title:
-        result["title_issue"] = "❌ Missing title tag"
+        data["title_issue"] = "❌ Missing title tag"
     elif len(title) < 30:
-        result["title_issue"] = "⚠️ Title too short (< 30 chars)"
+        data["title_issue"] = "⚠️ Too short (< 30 chars)"
     elif len(title) > 60:
-        result["title_issue"] = "⚠️ Title too long (> 60 chars)"
+        data["title_issue"] = "⚠️ Too long (> 60 chars)"
     else:
-        result["title_issue"] = "✅ OK"
+        data["title_issue"] = "✅ OK"
 
-    # ── META DESCRIPTION ───────────────────
-    meta_desc_tag = soup.find("meta", attrs={"name": "description"})
-    meta_desc = meta_desc_tag["content"].strip() if meta_desc_tag and meta_desc_tag.get("content") else ""
-    result["meta_description"] = meta_desc[:200]  # truncate for sheet
-    result["meta_desc_length"] = len(meta_desc)
-    if not meta_desc:
-        result["meta_desc_issue"] = "❌ Missing meta description"
-    elif len(meta_desc) < 70:
-        result["meta_desc_issue"] = "⚠️ Meta desc too short (< 70 chars)"
-    elif len(meta_desc) > 160:
-        result["meta_desc_issue"] = "⚠️ Meta desc too long (> 160 chars)"
+    # META DESCRIPTION
+    meta_tag = soup.find("meta", attrs={"name": "description"})
+    meta = meta_tag["content"].strip() if meta_tag and meta_tag.get("content") else ""
+    data["meta_description"] = meta[:200]
+    data["meta_desc_length"] = len(meta)
+    if not meta:
+        data["meta_desc_issue"] = "❌ Missing"
+    elif len(meta) < 70:
+        data["meta_desc_issue"] = "⚠️ Too short (< 70 chars)"
+    elif len(meta) > 160:
+        data["meta_desc_issue"] = "⚠️ Too long (> 160 chars)"
     else:
-        result["meta_desc_issue"] = "✅ OK"
+        data["meta_desc_issue"] = "✅ OK"
 
-    # ── H1 TAGS ────────────────────────────
-    h1_tags = soup.find_all("h1")
-    result["h1_count"] = len(h1_tags)
-    result["h1_text"] = " | ".join(h.get_text(strip=True) for h in h1_tags)[:200]
-    if len(h1_tags) == 0:
-        result["h1_issue"] = "❌ No H1 found"
-    elif len(h1_tags) > 1:
-        result["h1_issue"] = f"⚠️ Multiple H1s ({len(h1_tags)})"
+    # H1
+    h1s = soup.find_all("h1")
+    data["h1_count"] = len(h1s)
+    data["h1_text"] = " | ".join(h.get_text(strip=True) for h in h1s)[:200]
+    if len(h1s) == 0:
+        data["h1_issue"] = "❌ No H1 found"
+    elif len(h1s) > 1:
+        data["h1_issue"] = f"⚠️ Multiple H1s ({len(h1s)})"
     else:
-        result["h1_issue"] = "✅ OK"
+        data["h1_issue"] = "✅ OK"
 
-    # ── H2 TAGS ────────────────────────────
-    result["h2_count"] = len(soup.find_all("h2"))
+    # H2
+    h2s = soup.find_all("h2")
+    data["h2_count"] = len(h2s)
+    data["h2_texts"] = " | ".join(h.get_text(strip=True) for h in h2s[:5])[:300]
 
-    # ── IMAGES ─────────────────────────────
-    images = soup.find_all("img")
-    missing_alt = [img for img in images if not img.get("alt")]
-    result["images_total"] = len(images)
-    result["images_missing_alt"] = len(missing_alt)
-    if missing_alt:
-        result["images_issue"] = f"⚠️ {len(missing_alt)} image(s) missing alt text"
-    else:
-        result["images_issue"] = "✅ OK" if images else "➖ No images"
+    # IMAGES
+    imgs = soup.find_all("img")
+    missing_alt = [i for i in imgs if not i.get("alt")]
+    data["images_total"] = len(imgs)
+    data["images_missing_alt"] = len(missing_alt)
+    data["images_issue"] = f"⚠️ {len(missing_alt)} missing alt" if missing_alt else ("✅ OK" if imgs else "➖ No images")
 
-    # ── CANONICAL ──────────────────────────
-    canonical_tag = soup.find("link", attrs={"rel": "canonical"})
-    canonical = canonical_tag["href"].strip() if canonical_tag and canonical_tag.get("href") else ""
-    result["canonical"] = canonical
-    result["canonical_issue"] = "✅ OK" if canonical else "⚠️ No canonical tag"
+    # CANONICAL
+    canon = soup.find("link", attrs={"rel": "canonical"})
+    data["canonical"] = canon["href"].strip() if canon and canon.get("href") else ""
+    data["canonical_issue"] = "✅ OK" if data["canonical"] else "⚠️ Missing canonical"
 
-    # ── ROBOTS META ────────────────────────
-    robots_tag = soup.find("meta", attrs={"name": "robots"})
-    robots = robots_tag["content"].strip() if robots_tag and robots_tag.get("content") else "not set"
-    result["robots_meta"] = robots
-    if "noindex" in robots.lower():
-        result["robots_meta"] = f"❌ NOINDEX — {robots}"
+    # ROBOTS
+    robots = soup.find("meta", attrs={"name": "robots"})
+    data["robots_meta"] = robots["content"].strip() if robots and robots.get("content") else "not set"
+    if "noindex" in data["robots_meta"].lower():
+        data["robots_meta"] = f"❌ NOINDEX — {data['robots_meta']}"
 
-    # ── OPEN GRAPH ─────────────────────────
-    og_title = soup.find("meta", property="og:title")
-    og_desc  = soup.find("meta", property="og:description")
-    og_image = soup.find("meta", property="og:image")
+    # OPEN GRAPH
     og_parts = []
-    if og_title: og_parts.append("title")
-    if og_desc:  og_parts.append("desc")
-    if og_image: og_parts.append("image")
-    result["open_graph"] = f"✅ ({', '.join(og_parts)})" if og_parts else "⚠️ Missing OG tags"
+    if soup.find("meta", property="og:title"):   og_parts.append("title")
+    if soup.find("meta", property="og:description"): og_parts.append("desc")
+    if soup.find("meta", property="og:image"):   og_parts.append("image")
+    data["open_graph"] = f"✅ ({', '.join(og_parts)})" if og_parts else "⚠️ Missing OG tags"
 
-    # ── SCORE ──────────────────────────────
+    # SCHEMA
+    schema_tags = soup.find_all("script", attrs={"type": "application/ld+json"})
+    data["schema_markup"] = f"✅ {len(schema_tags)} schema block(s) found" if schema_tags else "⚠️ No schema/structured data"
+
+    # LINKS
+    from urllib.parse import urlparse
+    base_domain = urlparse(url).netloc
+    all_links = soup.find_all("a", href=True)
+    internal = [a for a in all_links if base_domain in a["href"] or a["href"].startswith("/")]
+    data["internal_links"] = len(internal)
+    data["external_links"] = len(all_links) - len(internal)
+
+    # WORD COUNT + TEXT SNIPPET
+    body_text = soup.get_text(separator=" ", strip=True)
+    words = body_text.split()
+    data["word_count"] = len(words)
+    data["page_text_snippet"] = " ".join(words[:300])  # first 300 words for AI context
+
+    # BASE SCORE
     score = 100
-    if not title:                    score -= 20
-    elif "⚠️" in result["title_issue"]: score -= 5
-    if not meta_desc:                score -= 20
-    elif "⚠️" in result["meta_desc_issue"]: score -= 5
-    if result["h1_count"] == 0:      score -= 15
-    elif result["h1_count"] > 1:     score -= 5
-    if result["images_missing_alt"]: score -= 10
-    if not canonical:                score -= 5
-    if not og_parts:                 score -= 5
-    if "noindex" in robots.lower():  score -= 20
-    result["overall_score"] = max(score, 0)
+    if not title:                              score -= 20
+    elif "⚠️" in data["title_issue"]:         score -= 5
+    if not meta:                               score -= 20
+    elif "⚠️" in data["meta_desc_issue"]:     score -= 5
+    if data["h1_count"] == 0:                  score -= 15
+    elif data["h1_count"] > 1:                 score -= 5
+    if data["images_missing_alt"]:             score -= 10
+    if not data["canonical"]:                  score -= 5
+    if not og_parts:                           score -= 5
+    if "noindex" in data["robots_meta"].lower(): score -= 20
+    if not schema_tags:                        score -= 5
+    if data["word_count"] < 300:               score -= 10
+    data["base_score"] = max(score, 0)
 
-    return result
+    return data
+
+
+# ─────────────────────────────────────────────
+# GROQ AI ANALYSIS
+# ─────────────────────────────────────────────
+
+def ask_groq_expert(seo_data: dict) -> dict:
+    """Send scraped SEO data to Groq and get expert AI analysis."""
+
+    user_prompt = f"""Analyze this webpage SEO data and give me your expert verdict:
+
+URL: {seo_data['url']}
+Status Code: {seo_data['status_code']}
+
+--- ON-PAGE SIGNALS ---
+Title: "{seo_data['title']}" ({seo_data['title_length']} chars) — {seo_data['title_issue']}
+Meta Description: "{seo_data['meta_description']}" ({seo_data['meta_desc_length']} chars) — {seo_data['meta_desc_issue']}
+H1 Tags ({seo_data['h1_count']}): {seo_data['h1_text']}
+H2 Tags ({seo_data['h2_count']}): {seo_data['h2_texts']}
+Word Count: {seo_data['word_count']} words
+
+--- TECHNICAL SEO ---
+Canonical URL: {seo_data['canonical']} — {seo_data['canonical_issue']}
+Robots Meta: {seo_data['robots_meta']}
+Schema Markup: {seo_data['schema_markup']}
+Images: {seo_data['images_total']} total, {seo_data['images_missing_alt']} missing alt — {seo_data['images_issue']}
+
+--- CONTENT & LINKS ---
+Internal Links: {seo_data['internal_links']}
+External Links: {seo_data['external_links']}
+Open Graph: {seo_data['open_graph']}
+
+--- PAGE CONTENT SAMPLE (first 300 words) ---
+{seo_data['page_text_snippet']}
+
+Base Technical Score: {seo_data['base_score']}/100
+
+Give me your full expert SEO analysis in the JSON format specified."""
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": SEO_EXPERT_SYSTEM_PROMPT},
+            {"role": "user",   "content": user_prompt},
+        ],
+        "temperature": 0.4,
+        "max_tokens": 1500,
+    }
+
+    fallback = {
+        "expert_summary": "AI analysis unavailable.",
+        "title_suggestion": "N/A",
+        "meta_suggestion": "N/A",
+        "top_issues": [],
+        "quick_wins": "N/A",
+        "ai_score": seo_data["base_score"],
+    }
+
+    try:
+        resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"].strip()
+
+        # Strip markdown fences if present
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+
+        return json.loads(content)
+
+    except Exception as e:
+        print(f"  ⚠️  Groq API error: {e}")
+        return fallback
 
 
 # ─────────────────────────────────────────────
@@ -185,77 +305,96 @@ def audit_page(url: str) -> dict:
 # ─────────────────────────────────────────────
 
 COLUMN_HEADERS = [
-    "URL",
-    "Status Code",
-    "Title",
-    "Title Length",
-    "Title Issue",
-    "Meta Description",
-    "Meta Desc Length",
-    "Meta Desc Issue",
-    "H1 Count",
-    "H1 Text",
-    "H1 Issue",
-    "H2 Count",
-    "Images Total",
-    "Images Missing Alt",
-    "Images Issue",
-    "Canonical URL",
-    "Canonical Issue",
-    "Robots Meta",
+    # Basic Info
+    "URL", "Status Code",
+    # Title
+    "Title", "Title Length", "Title Issue", "💡 AI Title Suggestion",
+    # Meta
+    "Meta Description", "Meta Desc Length", "Meta Desc Issue", "💡 AI Meta Suggestion",
+    # Headings & Content
+    "H1 Count", "H1 Text", "H1 Issue",
+    "H2 Count", "Word Count",
+    # Technical
+    "Canonical URL", "Canonical Issue",
+    "Robots Meta", "Schema Markup",
+    # Media & Links
+    "Images Total", "Images Missing Alt", "Images Issue",
+    "Internal Links", "External Links",
+    # Social
     "Open Graph",
-    "SEO Score (/100)",
-    "Notes",
+    # AI Expert Analysis
+    "🧠 Expert Summary",
+    "🔴 Issue #1 (Priority | Issue | Reason | Fix)",
+    "🟡 Issue #2 (Priority | Issue | Reason | Fix)",
+    "🟢 Issue #3 (Priority | Issue | Reason | Fix)",
+    "⚡ Quick Wins This Week",
+    # Scores
+    "Base Score (/100)", "🏆 AI Expert Score (/100)",
 ]
 
 
-def result_to_row(r: dict) -> list:
+def format_issue(issue: dict) -> str:
+    if not issue:
+        return ""
+    return f"[{issue.get('priority','?')}] {issue.get('issue','')} | WHY: {issue.get('reason','')} | FIX: {issue.get('fix','')}"
+
+
+def build_row(seo: dict, ai: dict) -> list:
+    issues = ai.get("top_issues", [{}, {}, {}])
+    while len(issues) < 3:
+        issues.append({})
+
     return [
-        r["url"],
-        r["status_code"],
-        r["title"],
-        r["title_length"],
-        r["title_issue"],
-        r["meta_description"],
-        r["meta_desc_length"],
-        r["meta_desc_issue"],
-        r["h1_count"],
-        r["h1_text"],
-        r["h1_issue"],
-        r["h2_count"],
-        r["images_total"],
-        r["images_missing_alt"],
-        r["images_issue"],
-        r["canonical"],
-        r["canonical_issue"],
-        r["robots_meta"],
-        r["open_graph"],
-        r["overall_score"],
-        r["notes"],
+        seo["url"],
+        seo["status_code"],
+        seo["title"],
+        seo["title_length"],
+        seo["title_issue"],
+        ai.get("title_suggestion", ""),
+        seo["meta_description"],
+        seo["meta_desc_length"],
+        seo["meta_desc_issue"],
+        ai.get("meta_suggestion", ""),
+        seo["h1_count"],
+        seo["h1_text"],
+        seo["h1_issue"],
+        seo["h2_count"],
+        seo["word_count"],
+        seo["canonical"],
+        seo["canonical_issue"],
+        seo["robots_meta"],
+        seo["schema_markup"],
+        seo["images_total"],
+        seo["images_missing_alt"],
+        seo["images_issue"],
+        seo["internal_links"],
+        seo["external_links"],
+        seo["open_graph"],
+        ai.get("expert_summary", ""),
+        format_issue(issues[0]),
+        format_issue(issues[1]),
+        format_issue(issues[2]),
+        ai.get("quick_wins", ""),
+        seo["base_score"],
+        ai.get("ai_score", seo["base_score"]),
     ]
 
 
 def create_or_get_sheet(service, spreadsheet_id: str, sheet_name: str) -> int:
-    """Create a new sheet tab if it doesn't exist. Returns the sheet ID."""
     spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
     existing = {s["properties"]["title"]: s["properties"]["sheetId"]
                 for s in spreadsheet["sheets"]}
-
     if sheet_name in existing:
-        print(f"  Sheet '{sheet_name}' already exists, using it.")
+        print(f"  Sheet '{sheet_name}' already exists.")
         return existing[sheet_name]
-
     body = {"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]}
-    resp = service.spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id, body=body
-    ).execute()
+    resp = service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
     new_id = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
-    print(f"  Created new sheet: '{sheet_name}'")
+    print(f"  ✅ Created sheet: '{sheet_name}'")
     return new_id
 
 
 def write_to_sheet(service, spreadsheet_id: str, sheet_name: str, rows: list):
-    """Write header + data rows to the sheet."""
     values = [COLUMN_HEADERS] + rows
 
     service.spreadsheets().values().update(
@@ -265,26 +404,37 @@ def write_to_sheet(service, spreadsheet_id: str, sheet_name: str, rows: list):
         body={"values": values},
     ).execute()
 
-    # Bold the header row
     sheet_id = create_or_get_sheet(service, spreadsheet_id, sheet_name)
+
     fmt_requests = [
+        # Dark header row
         {
             "repeatCell": {
-                "range": {
-                    "sheetId": sheet_id,
-                    "startRowIndex": 0,
-                    "endRowIndex": 1,
-                },
+                "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1},
                 "cell": {
                     "userEnteredFormat": {
-                        "textFormat": {"bold": True},
-                        "backgroundColor": {"red": 0.2, "green": 0.2, "blue": 0.2},
-                        "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
+                        "backgroundColor": {"red": 0.13, "green": 0.13, "blue": 0.13},
+                        "textFormat": {
+                            "bold": True,
+                            "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0},
+                            "fontSize": 10,
+                        },
                     }
                 },
-                "fields": "userEnteredFormat(textFormat,backgroundColor)",
+                "fields": "userEnteredFormat(backgroundColor,textFormat)",
             }
         },
+        # Freeze header row
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": sheet_id,
+                    "gridProperties": {"frozenRowCount": 1},
+                },
+                "fields": "gridProperties.frozenRowCount",
+            }
+        },
+        # Auto-resize all columns
         {
             "autoResizeDimensions": {
                 "dimensions": {
@@ -302,7 +452,7 @@ def write_to_sheet(service, spreadsheet_id: str, sheet_name: str, rows: list):
         body={"requests": fmt_requests},
     ).execute()
 
-    print(f"  ✅ Wrote {len(rows)} row(s) to sheet '{sheet_name}'")
+    print(f"  ✅ Wrote {len(rows)} row(s) to '{sheet_name}'")
 
 
 # ─────────────────────────────────────────────
@@ -313,7 +463,8 @@ def main():
     today = datetime.date.today().strftime("%Y-%m-%d")
     sheet_name = f"SEO Audit {today}"
 
-    print(f"\n🦴 SEO AUDIT STARTING — {today}")
+    print(f"\n🦴 SEO AUDIT + AI EXPERT — {today}")
+    print(f"   Model    : {GROQ_MODEL}")
     print(f"   Websites : {WEBSITES}")
     print(f"   Sheet    : {sheet_name}\n")
 
@@ -321,16 +472,27 @@ def main():
     create_or_get_sheet(service, SPREADSHEET_ID, sheet_name)
 
     all_rows = []
-    for url in WEBSITES:
-        print(f"  Auditing: {url}")
-        result = audit_page(url)
-        row = result_to_row(result)
+    for i, url in enumerate(WEBSITES):
+        print(f"\n  [{i+1}/{len(WEBSITES)}] Auditing: {url}")
+
+        print("    → Scraping page...")
+        seo_data = scrape_seo_data(url)
+        print(f"    → Base Score: {seo_data['base_score']}/100")
+
+        print("    → Asking AI SEO Expert (Groq)...")
+        ai_analysis = ask_groq_expert(seo_data)
+        print(f"    → AI Expert Score: {ai_analysis.get('ai_score', '?')}/100")
+        print(f"    → Summary: {ai_analysis.get('expert_summary', '')[:100]}...")
+
+        row = build_row(seo_data, ai_analysis)
         all_rows.append(row)
-        score = result["overall_score"]
-        print(f"    Score: {score}/100")
+
+        # Respect Groq free tier rate limits between requests
+        if i < len(WEBSITES) - 1:
+            time.sleep(3)
 
     write_to_sheet(service, SPREADSHEET_ID, sheet_name, all_rows)
-    print(f"\n🎉 Done! Check your Google Sheet.")
+    print(f"\n🎉 All done! Check Google Sheet: SEO Audit {today}")
 
 
 if __name__ == "__main__":
