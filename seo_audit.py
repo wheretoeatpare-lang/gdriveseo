@@ -336,7 +336,14 @@ COLUMN_HEADERS = [
 def format_issue(issue: dict) -> str:
     if not issue:
         return ""
-    return f"[{issue.get('priority','?')}] {issue.get('issue','')} | WHY: {issue.get('reason','')} | FIX: {issue.get('fix','')}"
+    priority = issue.get('priority', '?')
+    icon = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(priority, "⚪")
+    return (
+        f"{icon} {priority} PRIORITY\n"
+        f"Issue: {issue.get('issue', '')}\n"
+        f"Why: {issue.get('reason', '')}\n"
+        f"Fix: {issue.get('fix', '')}"
+    )
 
 
 def build_row(seo: dict, ai: dict) -> list:
@@ -406,8 +413,133 @@ def write_to_sheet(service, spreadsheet_id: str, sheet_name: str, rows: list):
 
     sheet_id = create_or_get_sheet(service, spreadsheet_id, sheet_name)
 
+    # ── Column index helpers ──────────────────────────────────────────────────
+    col = {name: i for i, name in enumerate(COLUMN_HEADERS)}
+
+    # Columns that hold long AI text — cap at 350px wide, rest narrow/medium
+    wide_cols  = {col["🧠 Expert Summary"], col["⚡ Quick Wins This Week"],
+                  col["💡 AI Title Suggestion"], col["💡 AI Meta Suggestion"],
+                  col["🔴 Issue #1 (Priority | Issue | Reason | Fix)"],
+                  col["🟡 Issue #2 (Priority | Issue | Reason | Fix)"],
+                  col["🟢 Issue #3 (Priority | Issue | Reason | Fix)"]}
+    medium_cols = {col["URL"], col["Title"], col["Meta Description"],
+                   col["H1 Text"], col["Canonical URL"]}
+
+    def col_width_request(col_index, pixel_width):
+        return {
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": col_index,
+                    "endIndex": col_index + 1,
+                },
+                "properties": {"pixelSize": pixel_width},
+                "fields": "pixelSize",
+            }
+        }
+
+    column_width_requests = []
+    for i in range(len(COLUMN_HEADERS)):
+        if i in wide_cols:
+            column_width_requests.append(col_width_request(i, 350))
+        elif i in medium_cols:
+            column_width_requests.append(col_width_request(i, 220))
+        else:
+            column_width_requests.append(col_width_request(i, 110))
+
+    # ── Row height — taller data rows so wrapped text breathes ───────────────
+    row_height_requests = []
+    if rows:
+        row_height_requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": 1,
+                    "endIndex": 1 + len(rows),
+                },
+                "properties": {"pixelSize": 120},
+                "fields": "pixelSize",
+            }
+        })
+
+    # ── Data rows: wrap text + top-align ─────────────────────────────────────
+    data_wrap_request = {
+        "repeatCell": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": 1,
+                "endRowIndex": 1 + len(rows),
+            },
+            "cell": {
+                "userEnteredFormat": {
+                    "wrapStrategy": "WRAP",
+                    "verticalAlignment": "TOP",
+                    "textFormat": {"fontSize": 9},
+                }
+            },
+            "fields": "userEnteredFormat(wrapStrategy,verticalAlignment,textFormat)",
+        }
+    }
+
+    # ── Highlight AI / issue columns with subtle background ──────────────────
+    def bg_col_request(col_index, r, g, b):
+        return {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 1,
+                    "endRowIndex": 1 + len(rows),
+                    "startColumnIndex": col_index,
+                    "endColumnIndex": col_index + 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": r, "green": g, "blue": b}
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor)",
+            }
+        }
+
+    color_requests = [
+        # Expert summary — soft blue
+        bg_col_request(col["🧠 Expert Summary"], 0.90, 0.95, 1.0),
+        # Quick wins — soft green
+        bg_col_request(col["⚡ Quick Wins This Week"], 0.90, 1.0, 0.92),
+        # Issue columns — soft red / yellow / green tint
+        bg_col_request(col["🔴 Issue #1 (Priority | Issue | Reason | Fix)"], 1.0, 0.92, 0.92),
+        bg_col_request(col["🟡 Issue #2 (Priority | Issue | Reason | Fix)"], 1.0, 0.98, 0.88),
+        bg_col_request(col["🟢 Issue #3 (Priority | Issue | Reason | Fix)"], 0.92, 1.0, 0.92),
+        # Score columns — light gold
+        bg_col_request(col["Base Score (/100)"],          0.99, 0.97, 0.82),
+        bg_col_request(col["🏆 AI Expert Score (/100)"],  0.99, 0.97, 0.82),
+    ]
+
+    # ── Alternate row banding for easier reading ──────────────────────────────
+    banding_request = {
+        "addBanding": {
+            "bandedRange": {
+                "bandedRangeId": 1,
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 1,
+                    "endRowIndex": 1 + len(rows),
+                    "startColumnIndex": 0,
+                    "endColumnIndex": len(COLUMN_HEADERS),
+                },
+                "rowProperties": {
+                    "headerColor":      {"red": 0.13, "green": 0.13, "blue": 0.13},
+                    "firstBandColor":   {"red": 1.0,  "green": 1.0,  "blue": 1.0},
+                    "secondBandColor":  {"red": 0.95, "green": 0.96, "blue": 0.98},
+                },
+            }
+        }
+    }
+
     fmt_requests = [
-        # Dark header row
+        # ── Dark header row ──────────────────────────────────────────────────
         {
             "repeatCell": {
                 "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1},
@@ -419,32 +551,28 @@ def write_to_sheet(service, spreadsheet_id: str, sheet_name: str, rows: list):
                             "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0},
                             "fontSize": 10,
                         },
+                        "verticalAlignment": "MIDDLE",
+                        "wrapStrategy": "WRAP",
                     }
                 },
-                "fields": "userEnteredFormat(backgroundColor,textFormat)",
+                "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment,wrapStrategy)",
             }
         },
-        # Freeze header row
+        # ── Freeze header + first column ─────────────────────────────────────
         {
             "updateSheetProperties": {
                 "properties": {
                     "sheetId": sheet_id,
-                    "gridProperties": {"frozenRowCount": 1},
+                    "gridProperties": {"frozenRowCount": 1, "frozenColumnCount": 1},
                 },
-                "fields": "gridProperties.frozenRowCount",
+                "fields": "gridProperties.frozenRowCount,gridProperties.frozenColumnCount",
             }
         },
-        # Auto-resize all columns
-        {
-            "autoResizeDimensions": {
-                "dimensions": {
-                    "sheetId": sheet_id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 0,
-                    "endIndex": len(COLUMN_HEADERS),
-                }
-            }
-        },
+        banding_request,
+        data_wrap_request,
+        *column_width_requests,
+        *row_height_requests,
+        *color_requests,
     ]
 
     service.spreadsheets().batchUpdate(
