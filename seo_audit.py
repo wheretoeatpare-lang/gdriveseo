@@ -450,7 +450,6 @@ Canonical URL: {seo_data['canonical']} — {seo_data['canonical_issue']}
 Robots Meta: {seo_data['robots_meta']}
 Robots.txt: {seo_data['robots_txt']} — {seo_data['robots_txt_issue']}
 Sitemap: {seo_data['sitemap_url']} — {seo_data['sitemap_status']} — {seo_data['sitemap_issue']}
-Google Index Status: {seo_data['google_indexed']} | Pages indexed: {seo_data['google_indexed_count']} — {seo_data['google_indexed_issue']}
 Schema Markup: {seo_data['schema_markup']}
 Images: {seo_data['images_total']} total, {seo_data['images_missing_alt']} missing alt — {seo_data['images_issue']}
 
