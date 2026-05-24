@@ -1,9 +1,9 @@
-name: Daily SEO Audit (AI-Powered)
+name: Daily SEO Audit
 
 on:
   schedule:
-    - cron: "0 0 * * *"
-  workflow_dispatch:
+    - cron: "0 0 * * *" # Runs every day at midnight UTC
+  workflow_dispatch: # Allows manual trigger from GitHub UI
 
 jobs:
   seo-audit:
@@ -11,20 +11,22 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
 
-      - name: Run AI SEO Audit
+      - name: Run SEO Audit
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           WEBSITES: ${{ secrets.WEBSITES }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-        run: python seo_audit.py
+        run: |
+          python seo_audit.py
