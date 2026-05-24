@@ -306,7 +306,7 @@ Give me your full expert SEO analysis in the JSON format specified."""
 
 COLUMN_HEADERS = [
     # Basic Info
-    "URL", "Status Code",
+    "Audited At", "URL", "Status Code",
     # Title
     "Title", "Title Length", "Title Issue", "💡 AI Title Suggestion",
     # Meta
@@ -346,12 +346,13 @@ def format_issue(issue: dict) -> str:
     )
 
 
-def build_row(seo: dict, ai: dict) -> list:
+def build_row(seo: dict, ai: dict, audited_at: str) -> list:
     issues = ai.get("top_issues", [{}, {}, {}])
     while len(issues) < 3:
         issues.append({})
 
     return [
+        audited_at,
         seo["url"],
         seo["status_code"],
         seo["title"],
@@ -401,17 +402,42 @@ def create_or_get_sheet(service, spreadsheet_id: str, sheet_name: str) -> int:
     return new_id
 
 
+def sheet_has_header(service, spreadsheet_id: str, sheet_name: str) -> bool:
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{sheet_name}'!A1:A1",
+    ).execute()
+    return bool(result.get("values"))
+
+
+def get_next_empty_row(service, spreadsheet_id: str, sheet_name: str) -> int:
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{sheet_name}'!A:A",
+    ).execute()
+    return len(result.get("values", [])) + 1
+
+
 def write_to_sheet(service, spreadsheet_id: str, sheet_name: str, rows: list):
-    values = [COLUMN_HEADERS] + rows
+    sheet_id = create_or_get_sheet(service, spreadsheet_id, sheet_name)
+    is_new   = not sheet_has_header(service, spreadsheet_id, sheet_name)
+
+    if is_new:
+        values     = [COLUMN_HEADERS] + rows
+        write_range = f"'{sheet_name}'!A1"
+        data_start  = 2  # row 2 = first data row (1-based)
+    else:
+        next_row    = get_next_empty_row(service, spreadsheet_id, sheet_name)
+        values      = rows
+        write_range = f"'{sheet_name}'!A{next_row}"
+        data_start  = next_row
 
     service.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
-        range=f"'{sheet_name}'!A1",
+        range=write_range,
         valueInputOption="RAW",
         body={"values": values},
     ).execute()
-
-    sheet_id = create_or_get_sheet(service, spreadsheet_id, sheet_name)
 
     # ── Column index helpers ──────────────────────────────────────────────────
     col = {name: i for i, name in enumerate(COLUMN_HEADERS)}
@@ -456,30 +482,31 @@ def write_to_sheet(service, spreadsheet_id: str, sheet_name: str, rows: list):
                 "range": {
                     "sheetId": sheet_id,
                     "dimension": "ROWS",
-                    "startIndex": 1,
-                    "endIndex": 1 + len(rows),
+                    "startIndex": data_start - 1,
+                    "endIndex": data_start - 1 + len(rows),
                 },
                 "properties": {"pixelSize": 120},
                 "fields": "pixelSize",
             }
         })
 
-    # ── Data rows: wrap text + top-align ─────────────────────────────────────
+    # ── Data rows: wrap text + top-align + explicit white bg ────────────────
     data_wrap_request = {
         "repeatCell": {
             "range": {
                 "sheetId": sheet_id,
-                "startRowIndex": 1,
-                "endRowIndex": 1 + len(rows),
+                "startRowIndex": data_start - 1,
+                "endRowIndex": data_start - 1 + len(rows),
             },
             "cell": {
                 "userEnteredFormat": {
                     "wrapStrategy": "WRAP",
                     "verticalAlignment": "TOP",
-                    "textFormat": {"fontSize": 9},
+                    "textFormat": {"fontSize": 9, "foregroundColor": {"red": 0.1, "green": 0.1, "blue": 0.1}},
+                    "backgroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0},
                 }
             },
-            "fields": "userEnteredFormat(wrapStrategy,verticalAlignment,textFormat)",
+            "fields": "userEnteredFormat(wrapStrategy,verticalAlignment,textFormat,backgroundColor)",
         }
     }
 
@@ -489,8 +516,8 @@ def write_to_sheet(service, spreadsheet_id: str, sheet_name: str, rows: list):
             "repeatCell": {
                 "range": {
                     "sheetId": sheet_id,
-                    "startRowIndex": 1,
-                    "endRowIndex": 1 + len(rows),
+                    "startRowIndex": data_start - 1,
+                    "endRowIndex": data_start - 1 + len(rows),
                     "startColumnIndex": col_index,
                     "endColumnIndex": col_index + 1,
                 },
@@ -521,18 +548,16 @@ def write_to_sheet(service, spreadsheet_id: str, sheet_name: str, rows: list):
     banding_request = {
         "addBanding": {
             "bandedRange": {
-                "bandedRangeId": 1,
                 "range": {
                     "sheetId": sheet_id,
-                    "startRowIndex": 1,
-                    "endRowIndex": 1 + len(rows),
+                    "startRowIndex": data_start - 1,
+                    "endRowIndex": data_start - 1 + len(rows),
                     "startColumnIndex": 0,
                     "endColumnIndex": len(COLUMN_HEADERS),
                 },
                 "rowProperties": {
-                    "headerColor":      {"red": 0.13, "green": 0.13, "blue": 0.13},
-                    "firstBandColor":   {"red": 1.0,  "green": 1.0,  "blue": 1.0},
-                    "secondBandColor":  {"red": 0.95, "green": 0.96, "blue": 0.98},
+                    "firstBandColor":  {"red": 1.0,  "green": 1.0,  "blue": 1.0},
+                    "secondBandColor": {"red": 0.95, "green": 0.96, "blue": 0.98},
                 },
             }
         }
@@ -588,16 +613,16 @@ def write_to_sheet(service, spreadsheet_id: str, sheet_name: str, rows: list):
 # ─────────────────────────────────────────────
 
 def main():
-    today = datetime.date.today().strftime("%Y-%m-%d")
+    today      = datetime.date.today().strftime("%Y-%m-%d")
+    audited_at = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     sheet_name = f"SEO Audit {today}"
 
-    print(f"\n🦴 SEO AUDIT + AI EXPERT — {today}")
+    print(f"\n🦴 SEO AUDIT + AI EXPERT — {audited_at}")
     print(f"   Model    : {GROQ_MODEL}")
     print(f"   Websites : {WEBSITES}")
     print(f"   Sheet    : {sheet_name}\n")
 
     service = get_sheets_service()
-    create_or_get_sheet(service, SPREADSHEET_ID, sheet_name)
 
     all_rows = []
     for i, url in enumerate(WEBSITES):
@@ -612,7 +637,7 @@ def main():
         print(f"    → AI Expert Score: {ai_analysis.get('ai_score', '?')}/100")
         print(f"    → Summary: {ai_analysis.get('expert_summary', '')[:100]}...")
 
-        row = build_row(seo_data, ai_analysis)
+        row = build_row(seo_data, ai_analysis, audited_at)
         all_rows.append(row)
 
         # Respect Groq free tier rate limits between requests
@@ -620,7 +645,7 @@ def main():
             time.sleep(3)
 
     write_to_sheet(service, SPREADSHEET_ID, sheet_name, all_rows)
-    print(f"\n🎉 All done! Check Google Sheet: SEO Audit {today}")
+    print(f"\n🎉 All done! Check Google Sheet: SEO Audit {today} — appended {len(all_rows)} row(s)")
 
 
 if __name__ == "__main__":
