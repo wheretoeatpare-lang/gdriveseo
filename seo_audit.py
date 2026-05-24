@@ -290,9 +290,6 @@ def scrape_seo_data(url: str) -> dict:
         "sitemap_url": "",
         "sitemap_status": "",
         "sitemap_issue": "",
-        "google_indexed": "",
-        "google_indexed_count": "",
-        "google_indexed_issue": "",
         "base_score": 0,
     }
 
@@ -410,12 +407,6 @@ def scrape_seo_data(url: str) -> dict:
     data["sitemap_status"] = sitemap_result["status"]
     data["sitemap_issue"]  = sitemap_result["issue"]
 
-    # GOOGLE INDEX CHECK
-    google_result = check_google_index(_root)
-    data["google_indexed"]       = google_result["indexed"]
-    data["google_indexed_count"] = google_result["count"]
-    data["google_indexed_issue"] = google_result["issue"]
-
     # BASE SCORE
     score = 100
     if not title:                              score -= 20
@@ -432,7 +423,6 @@ def scrape_seo_data(url: str) -> dict:
     if data["word_count"] < 300:               score -= 10
     if "❌" in data["robots_txt_issue"]:       score -= 5
     if "❌" in data["sitemap_issue"]:          score -= 5
-    if "❌" in data["google_indexed_issue"]:   score -= 20  # catastrophic if not indexed!
     data["base_score"] = max(score, 0)
 
     return data
@@ -607,7 +597,6 @@ COLUMN_HEADERS = [
     "Robots Meta", "Schema Markup",
     "Robots.txt Status", "Robots.txt Issue",
     "Sitemap URL", "Sitemap Status", "Sitemap Issue",
-    "Google Indexed?", "Google Indexed Pages", "Google Index Issue",
     # Media & Links
     "Images Total", "Images Missing Alt", "Images Issue",
     "Internal Links", "External Links",
@@ -668,9 +657,6 @@ def build_row(seo: dict, ai: dict, audited_at: str) -> list:
         seo["sitemap_url"],
         seo["sitemap_status"],
         seo["sitemap_issue"],
-        seo["google_indexed"],
-        seo["google_indexed_count"],
-        seo["google_indexed_issue"],
         seo["images_total"],
         seo["images_missing_alt"],
         seo["images_issue"],
@@ -908,6 +894,102 @@ def write_to_sheet(service, spreadsheet_id: str, sheet_name: str, rows: list):
 
 
 # ─────────────────────────────────────────────
+# SITEMAP CRAWLER — discover all pages to audit
+# ─────────────────────────────────────────────
+
+def _parse_urls_from_sitemap(xml_text: str) -> list[str]:
+    """Extract all <loc> URLs from a sitemap or sitemap index XML."""
+    soup = BeautifulSoup(xml_text, "lxml-xml")
+    return [loc.get_text(strip=True) for loc in soup.find_all("loc")]
+
+
+def get_pages_from_sitemap(base_url: str, max_pages: int = 200) -> list[str]:
+    """
+    Discover every page URL for a site via its sitemap.
+    Handles sitemap indexes (recursively fetches child sitemaps).
+    Falls back to crawling internal links from the homepage if no sitemap found.
+    Returns a deduplicated list of URLs, capped at max_pages.
+    """
+    from urllib.parse import urlparse, urljoin
+
+    parsed = urlparse(base_url)
+    root   = f"{parsed.scheme}://{parsed.netloc}"
+
+    # ── Step 1: find the sitemap ────────────────────────────────────────────
+    robots_result  = check_robots_txt(root)
+    sitemap_hint   = robots_result.get("sitemap_hint", "")
+    sitemap_result = check_sitemap(root, sitemap_hint)
+    sitemap_url    = sitemap_result.get("url", "")
+
+    all_urls: list[str] = []
+
+    if sitemap_url:
+        print(f"    → 🗺️  Sitemap found: {sitemap_url}")
+        try:
+            resp = requests.get(sitemap_url, headers=FETCH_HEADERS, timeout=15)
+            resp.raise_for_status()
+            xml  = resp.text
+
+            # ── Sitemap index? Recurse into child sitemaps ──────────────────
+            if "<sitemapindex" in xml:
+                child_urls = _parse_urls_from_sitemap(xml)
+                print(f"    → 📂 Sitemap index with {len(child_urls)} child sitemap(s)")
+                for child_url in child_urls:
+                    try:
+                        cr = requests.get(child_url, headers=FETCH_HEADERS, timeout=15)
+                        cr.raise_for_status()
+                        all_urls.extend(_parse_urls_from_sitemap(cr.text))
+                        if len(all_urls) >= max_pages:
+                            break
+                    except Exception as e:
+                        print(f"    ⚠️  Could not fetch child sitemap {child_url}: {e}")
+            else:
+                all_urls = _parse_urls_from_sitemap(xml)
+
+        except Exception as e:
+            print(f"    ⚠️  Sitemap fetch failed: {e}")
+
+    # ── Step 2: fallback — crawl homepage links ─────────────────────────────
+    if not all_urls:
+        print(f"    → 🕷️  No sitemap — crawling homepage links as fallback...")
+        try:
+            _, soup = fetch_page(root)
+            if soup:
+                for a in soup.find_all("a", href=True):
+                    href = a["href"].strip()
+                    if href.startswith("/"):
+                        href = root + href
+                    if href.startswith(root) and href not in all_urls:
+                        all_urls.append(href)
+        except Exception as e:
+            print(f"    ⚠️  Homepage crawl failed: {e}")
+
+    # ── Step 3: filter to same domain, deduplicate, cap ─────────────────────
+    seen = set()
+    filtered = []
+    for u in all_urls:
+        # Keep only URLs on the same domain, skip anchors/feeds/assets
+        if urlparse(u).netloc != parsed.netloc:
+            continue
+        if any(u.endswith(ext) for ext in (".xml", ".pdf", ".jpg", ".png", ".gif", ".zip")):
+            continue
+        if "#" in u:
+            u = u.split("#")[0]
+        if u and u not in seen:
+            seen.add(u)
+            filtered.append(u)
+        if len(filtered) >= max_pages:
+            break
+
+    # Always ensure the root homepage is included
+    if root + "/" not in seen and root not in seen:
+        filtered.insert(0, root)
+
+    print(f"    → 📄 {len(filtered)} unique page(s) discovered (cap: {max_pages})")
+    return filtered
+
+
+# ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 
@@ -922,31 +1004,35 @@ def main():
     print(f"   Websites : {WEBSITES}")
     print(f"   Sheet    : {sheet_name}\n")
 
-    service = get_sheets_service()
-
+    service  = get_sheets_service()
     all_rows = []
-    for i, url in enumerate(WEBSITES):
-        print(f"\n  [{i+1}/{len(WEBSITES)}] Auditing: {url}")
 
-        print("    → Scraping page...")
-        seo_data = scrape_seo_data(url)
-        print(f"    → Base Score: {seo_data['base_score']}/100")
+    for site_url in WEBSITES:
+        print(f"\n🌐 Discovering pages for: {site_url}")
+        pages = get_pages_from_sitemap(site_url, max_pages=200)
+        print(f"   → Auditing {len(pages)} page(s)...\n")
 
-        print("    → Asking AI SEO Expert (Groq)...")
-        ai_analysis = ask_groq_expert(seo_data)
-        print(f"    → AI Expert Score: {ai_analysis.get('ai_score', '?')}/100")
-        print(f"    → Summary: {ai_analysis.get('expert_summary', '')[:100]}...")
+        for i, url in enumerate(pages):
+            print(f"  [{i+1}/{len(pages)}] Auditing: {url}")
 
-        row = build_row(seo_data, ai_analysis, audited_at)
-        all_rows.append(row)
+            print("    → Scraping page...")
+            seo_data = scrape_seo_data(url)
+            print(f"    → Base Score: {seo_data['base_score']}/100")
 
-        # Respect Groq free tier rate limits between requests
-        # Also gives Google a breather between site: checks
-        if i < len(WEBSITES) - 1:
-            time.sleep(5)
+            print("    → Asking AI SEO Expert...")
+            ai_analysis = ask_groq_expert(seo_data)
+            print(f"    → AI Expert Score: {ai_analysis.get('ai_score', '?')}/100")
+            print(f"    → Summary: {ai_analysis.get('expert_summary', '')[:100]}...")
+
+            row = build_row(seo_data, ai_analysis, audited_at)
+            all_rows.append(row)
+
+            # Be polite to servers — don't hammer too fast
+            if i < len(pages) - 1:
+                time.sleep(3)
 
     write_to_sheet(service, SPREADSHEET_ID, sheet_name, all_rows)
-    print(f"\n🎉 All done! Check Google Sheet: SEO Audit {today} — appended {len(all_rows)} row(s)")
+    print(f"\n🎉 All done! Check Google Sheet: SEO Audit {today} — audited {len(all_rows)} page(s) total")
 
 
 if __name__ == "__main__":
