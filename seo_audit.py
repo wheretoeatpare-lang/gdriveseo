@@ -89,6 +89,180 @@ def fetch_page(url: str):
 # BASIC SEO SCRAPER
 # ─────────────────────────────────────────────
 
+def check_google_index(base_url: str) -> dict:
+    """
+    Check if the site is indexed in Google using a site: search query.
+    Scrapes the Google search result count — no API key needed.
+    Returns indexed status, approximate page count, and any issues.
+    """
+    from urllib.parse import urlparse, quote_plus
+    parsed = urlparse(base_url)
+    domain = parsed.netloc.replace("www.", "")
+    query  = quote_plus(f"site:{domain}")
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    result = {
+        "indexed": "Unknown",
+        "count":   "Unknown",
+        "issue":   "⚠️ Could not check",
+    }
+
+    try:
+        resp = requests.get(
+            f"https://www.google.com/search?q={query}&num=10&hl=en",
+            headers=headers,
+            timeout=15,
+        )
+
+        if resp.status_code == 429 or "detected unusual traffic" in resp.text.lower():
+            result["indexed"] = "⚠️ Rate limited by Google"
+            result["count"]   = "N/A"
+            result["issue"]   = "⚠️ Google blocked the check — try again later"
+            return result
+
+        soup = BeautifulSoup(resp.text, "lxml")
+
+        # Check for "did not match any documents" — definitive not-indexed signal
+        no_results_signals = [
+            "did not match any documents",
+            "no results found",
+            "your search did not match",
+        ]
+        page_text = soup.get_text(" ", strip=True).lower()
+        if any(s in page_text for s in no_results_signals):
+            result["indexed"] = "❌ Not indexed"
+            result["count"]   = "0"
+            result["issue"]   = "❌ Site has NO pages in Google — submit sitemap via Google Search Console immediately"
+            return result
+
+        # Try to find result count in the stats bar (e.g. "About 1,240 results")
+        count_str = ""
+        # Method 1: #result-stats div
+        stats = soup.find(id="result-stats")
+        if stats:
+            count_str = stats.get_text(" ", strip=True)
+        # Method 2: look for "About X results" pattern anywhere
+        if not count_str:
+            import re
+            m = re.search(r"About ([\d,]+) result", resp.text)
+            if m:
+                count_str = m.group(1).replace(",", "")
+
+        # Count actual result snippets as a fallback
+        result_divs = soup.select("div.g, div[data-ved]")
+        snippet_count = len([d for d in result_divs if d.find("h3")])
+
+        if count_str:
+            num = int("".join(filter(str.isdigit, count_str.split()[0]))) if count_str.split() else 0
+            result["indexed"] = "✅ Indexed"
+            result["count"]   = f"~{count_str.split()[0]} pages"
+            result["issue"]   = "✅ OK"
+        elif snippet_count > 0:
+            result["indexed"] = "✅ Indexed"
+            result["count"]   = f"~{snippet_count}+ pages visible"
+            result["issue"]   = "✅ OK"
+        else:
+            # Could be indexed but Google didn't show count — inconclusive
+            result["indexed"] = "⚠️ Possibly indexed"
+            result["count"]   = "Unknown"
+            result["issue"]   = "⚠️ Could not confirm — verify manually in Google Search Console"
+
+    except Exception as e:
+        result["indexed"] = "⚠️ Check failed"
+        result["count"]   = "N/A"
+        result["issue"]   = f"⚠️ Error: {e}"
+
+    return result
+
+
+def check_robots_txt(base_url: str) -> dict:
+    """Fetch and analyse /robots.txt for the site."""
+    from urllib.parse import urlparse, urljoin
+    parsed   = urlparse(base_url)
+    root     = f"{parsed.scheme}://{parsed.netloc}"
+    robots_url = urljoin(root, "/robots.txt")
+    result   = {"url": robots_url, "status": "", "issue": "", "sitemap_hint": ""}
+    try:
+        resp = requests.get(robots_url, headers=FETCH_HEADERS, timeout=10)
+        if resp.status_code == 200:
+            text = resp.text
+            result["status"] = f"✅ Found ({len(text.splitlines())} lines)"
+            result["issue"]  = "✅ OK"
+            # Extract sitemap directives from robots.txt
+            sitemap_lines = [l.strip() for l in text.splitlines()
+                             if l.strip().lower().startswith("sitemap:")]
+            if sitemap_lines:
+                result["sitemap_hint"] = sitemap_lines[0].split(":", 1)[1].strip()
+        elif resp.status_code == 404:
+            result["status"] = "❌ Not found (404)"
+            result["issue"]  = "❌ Missing — Google can't find crawl rules"
+        else:
+            result["status"] = f"⚠️ HTTP {resp.status_code}"
+            result["issue"]  = f"⚠️ Unexpected status {resp.status_code}"
+    except Exception as e:
+        result["status"] = "❌ Error fetching"
+        result["issue"]  = f"❌ Error: {e}"
+    return result
+
+
+def check_sitemap(base_url: str, hint_url: str = "") -> dict:
+    """
+    Try to find a valid sitemap. Priority:
+    1. URL hinted from robots.txt Sitemap: directive
+    2. /sitemap.xml
+    3. /sitemap_index.xml
+    4. /sitemap.php
+    5. Listed in <link rel=sitemap> tag on homepage (checked by caller)
+    """
+    from urllib.parse import urlparse, urljoin
+    parsed = urlparse(base_url)
+    root   = f"{parsed.scheme}://{parsed.netloc}"
+
+    candidates = []
+    if hint_url:
+        candidates.append(hint_url)
+    candidates += [
+        urljoin(root, "/sitemap.xml"),
+        urljoin(root, "/sitemap_index.xml"),
+        urljoin(root, "/sitemap.php"),
+        urljoin(root, "/sitemap/sitemap.xml"),
+    ]
+
+    for candidate in candidates:
+        try:
+            resp = requests.get(candidate, headers=FETCH_HEADERS, timeout=10)
+            if resp.status_code == 200:
+                ct   = resp.headers.get("Content-Type", "")
+                text = resp.text[:2000]
+                is_xml  = "xml" in ct or text.strip().startswith("<?xml") or "<urlset" in text or "<sitemapindex" in text
+                is_index = "<sitemapindex" in text
+                url_count = text.count("<url>")
+                kind = "index" if is_index else "urlset"
+                detail = f"{url_count}+ URLs visible" if url_count else "valid XML"
+                return {
+                    "url":    candidate,
+                    "status": f"✅ Found ({kind}, {detail})" if is_xml else f"⚠️ Found but not valid XML",
+                    "issue":  "✅ OK" if is_xml else "⚠️ File exists but may not be valid XML sitemap",
+                }
+        except Exception:
+            continue
+
+    return {
+        "url":    "",
+        "status": "❌ Not found",
+        "issue":  "❌ No sitemap found — Google can't efficiently crawl all pages",
+    }
+
+
 def scrape_seo_data(url: str) -> dict:
     data = {
         "url": url,
@@ -106,6 +280,14 @@ def scrape_seo_data(url: str) -> dict:
         "external_links": 0,
         "word_count": 0,
         "schema_markup": "",
+        "robots_txt": "",
+        "robots_txt_issue": "",
+        "sitemap_url": "",
+        "sitemap_status": "",
+        "sitemap_issue": "",
+        "google_indexed": "",
+        "google_indexed_count": "",
+        "google_indexed_issue": "",
         "base_score": 0,
     }
 
@@ -202,6 +384,33 @@ def scrape_seo_data(url: str) -> dict:
     data["word_count"] = len(words)
     data["page_text_snippet"] = " ".join(words[:300])  # first 300 words for AI context
 
+    # ROBOTS.TXT
+    from urllib.parse import urlparse as _urlparse
+    _parsed  = _urlparse(url)
+    _root    = f"{_parsed.scheme}://{_parsed.netloc}"
+    robots_result = check_robots_txt(_root)
+    data["robots_txt"]       = robots_result["status"]
+    data["robots_txt_issue"] = robots_result["issue"]
+
+    # SITEMAP — check robots.txt hint first, then common paths, then <link rel=sitemap>
+    hint = robots_result.get("sitemap_hint", "")
+    # Also check for <link rel="sitemap"> in HTML
+    sitemap_link_tag = soup.find("link", attrs={"rel": "sitemap"})
+    if not hint and sitemap_link_tag and sitemap_link_tag.get("href"):
+        hint = sitemap_link_tag["href"].strip()
+        if hint.startswith("/"):
+            hint = _root + hint
+    sitemap_result = check_sitemap(_root, hint)
+    data["sitemap_url"]    = sitemap_result["url"]
+    data["sitemap_status"] = sitemap_result["status"]
+    data["sitemap_issue"]  = sitemap_result["issue"]
+
+    # GOOGLE INDEX CHECK
+    google_result = check_google_index(_root)
+    data["google_indexed"]       = google_result["indexed"]
+    data["google_indexed_count"] = google_result["count"]
+    data["google_indexed_issue"] = google_result["issue"]
+
     # BASE SCORE
     score = 100
     if not title:                              score -= 20
@@ -216,6 +425,9 @@ def scrape_seo_data(url: str) -> dict:
     if "noindex" in data["robots_meta"].lower(): score -= 20
     if not schema_tags:                        score -= 5
     if data["word_count"] < 300:               score -= 10
+    if "❌" in data["robots_txt_issue"]:       score -= 5
+    if "❌" in data["sitemap_issue"]:          score -= 5
+    if "❌" in data["google_indexed_issue"]:   score -= 20  # catastrophic if not indexed!
     data["base_score"] = max(score, 0)
 
     return data
@@ -243,6 +455,9 @@ Word Count: {seo_data['word_count']} words
 --- TECHNICAL SEO ---
 Canonical URL: {seo_data['canonical']} — {seo_data['canonical_issue']}
 Robots Meta: {seo_data['robots_meta']}
+Robots.txt: {seo_data['robots_txt']} — {seo_data['robots_txt_issue']}
+Sitemap: {seo_data['sitemap_url']} — {seo_data['sitemap_status']} — {seo_data['sitemap_issue']}
+Google Index Status: {seo_data['google_indexed']} | Pages indexed: {seo_data['google_indexed_count']} — {seo_data['google_indexed_issue']}
 Schema Markup: {seo_data['schema_markup']}
 Images: {seo_data['images_total']} total, {seo_data['images_missing_alt']} missing alt — {seo_data['images_issue']}
 
@@ -317,6 +532,9 @@ COLUMN_HEADERS = [
     # Technical
     "Canonical URL", "Canonical Issue",
     "Robots Meta", "Schema Markup",
+    "Robots.txt Status", "Robots.txt Issue",
+    "Sitemap URL", "Sitemap Status", "Sitemap Issue",
+    "Google Indexed?", "Google Indexed Pages", "Google Index Issue",
     # Media & Links
     "Images Total", "Images Missing Alt", "Images Issue",
     "Internal Links", "External Links",
@@ -372,6 +590,14 @@ def build_row(seo: dict, ai: dict, audited_at: str) -> list:
         seo["canonical_issue"],
         seo["robots_meta"],
         seo["schema_markup"],
+        seo["robots_txt"],
+        seo["robots_txt_issue"],
+        seo["sitemap_url"],
+        seo["sitemap_status"],
+        seo["sitemap_issue"],
+        seo["google_indexed"],
+        seo["google_indexed_count"],
+        seo["google_indexed_issue"],
         seo["images_total"],
         seo["images_missing_alt"],
         seo["images_issue"],
@@ -641,8 +867,9 @@ def main():
         all_rows.append(row)
 
         # Respect Groq free tier rate limits between requests
+        # Also gives Google a breather between site: checks
         if i < len(WEBSITES) - 1:
-            time.sleep(3)
+            time.sleep(5)
 
     write_to_sheet(service, SPREADSHEET_ID, sheet_name, all_rows)
     print(f"\n🎉 All done! Check Google Sheet: SEO Audit {today} — appended {len(all_rows)} row(s)")
