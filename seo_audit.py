@@ -14,13 +14,18 @@ from googleapiclient.discovery import build
 CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 SPREADSHEET_ID   = os.environ["SPREADSHEET_ID"]
 WEBSITES_RAW     = os.environ["WEBSITES"]
-GROQ_API_KEY     = os.environ["GROQ_API_KEY"]
+GROQ_API_KEY        = os.environ["GROQ_API_KEY"]
+OPENROUTER_API_KEY  = os.environ.get("OPENROUTER_API_KEY", "")  # fallback key
 
 WEBSITES = [url.strip() for url in WEBSITES_RAW.split(",") if url.strip()]
 SCOPES   = ["https://www.googleapis.com/auth/spreadsheets"]
 
 GROQ_MODEL   = "llama-3.3-70b-versatile"
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# OpenRouter fallback (used when Groq hits daily rate limit)
+OPENROUTER_MODEL   = "meta-llama/llama-3.3-70b-instruct"
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 SEO_EXPERT_SYSTEM_PROMPT = """You are Rex Morgan, a battle-hardened SEO expert with 15 years of experience.
 You have personally ranked hundreds of websites to #1 on Google — from small local businesses to Fortune 500 companies.
@@ -434,13 +439,11 @@ def scrape_seo_data(url: str) -> dict:
 
 
 # ─────────────────────────────────────────────
-# GROQ AI ANALYSIS
+# AI ANALYSIS (OpenRouter → Groq fallback)
 # ─────────────────────────────────────────────
 
-def ask_groq_expert(seo_data: dict) -> dict:
-    """Send scraped SEO data to Groq and get expert AI analysis."""
-
-    user_prompt = f"""Analyze this webpage SEO data and give me your expert verdict:
+def _build_user_prompt(seo_data: dict) -> str:
+    return f"""Analyze this webpage SEO data and give me your expert verdict:
 
 URL: {seo_data['url']}
 Status Code: {seo_data['status_code']}
@@ -473,11 +476,45 @@ Base Technical Score: {seo_data['base_score']}/100
 
 Give me your full expert SEO analysis in the JSON format specified."""
 
+
+def _parse_ai_response(content: str) -> dict:
+    """Strip markdown fences and parse JSON from AI response."""
+    content = content.strip()
+    if content.startswith("```"):
+        content = content.split("```")[1]
+        if content.startswith("json"):
+            content = content[4:]
+    return json.loads(content)
+
+
+def _is_rate_limit_error(resp: requests.Response) -> bool:
+    """Return True if the response signals a Groq daily rate limit."""
+    if resp.status_code == 429:
+        return True
+    # Groq also returns 413 / error codes for token-based limits
+    try:
+        body = resp.json()
+        error_type = body.get("error", {}).get("type", "")
+        error_msg  = str(body.get("error", {}).get("message", "")).lower()
+        if error_type in ("rate_limit_exceeded", "tokens_exceeded"):
+            return True
+        if "rate limit" in error_msg or "daily limit" in error_msg or "quota" in error_msg:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _call_groq(user_prompt: str) -> dict:
+    """Send request to Groq as fallback provider."""
+    if not GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY secret is not set — cannot fall back.")
+
+    print("    → 🔀 OpenRouter limit hit — switching to Groq...")
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
-
     payload = {
         "model": GROQ_MODEL,
         "messages": [
@@ -487,6 +524,17 @@ Give me your full expert SEO analysis in the JSON format specified."""
         "temperature": 0.4,
         "max_tokens": 1500,
     }
+    resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
+    resp.raise_for_status()
+    content = resp.json()["choices"][0]["message"]["content"]
+    print("    → ✅ Used Groq (fallback)")
+    return _parse_ai_response(content)
+
+
+def ask_groq_expert(seo_data: dict) -> dict:
+    """Send scraped SEO data to OpenRouter (with Groq fallback) and get expert AI analysis."""
+
+    user_prompt = _build_user_prompt(seo_data)
 
     fallback = {
         "expert_summary": "AI analysis unavailable.",
@@ -497,21 +545,46 @@ Give me your full expert SEO analysis in the JSON format specified."""
         "ai_score": seo_data["base_score"],
     }
 
+    # ── 1. Try OpenRouter first ──────────────────────────────────────────────
     try:
-        resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com",  # recommended by OpenRouter
+            "X-Title": "SEO Audit Bot",
+        }
+        payload = {
+            "model": OPENROUTER_MODEL,
+            "messages": [
+                {"role": "system", "content": SEO_EXPERT_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+            "temperature": 0.4,
+            "max_tokens": 1500,
+        }
+
+        resp = requests.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=30)
+
+        # ── 2. Detect rate/credit limit → fall back to Groq ─────────────────
+        if _is_rate_limit_error(resp):
+            return _call_groq(user_prompt)
+
         resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"].strip()
+        content = resp.json()["choices"][0]["message"]["content"]
+        print("    → ✅ Used OpenRouter")
+        return _parse_ai_response(content)
 
-        # Strip markdown fences if present
-        if content.startswith("```"):
-            content = content.split("```")[1]
-            if content.startswith("json"):
-                content = content[4:]
-
-        return json.loads(content)
+    except requests.HTTPError as e:
+        print(f"  ⚠️  OpenRouter HTTP error: {e}")
+        # One more chance: try Groq before giving up entirely
+        try:
+            return _call_groq(user_prompt)
+        except Exception as gr_err:
+            print(f"  ⚠️  Groq also failed: {gr_err}")
+            return fallback
 
     except Exception as e:
-        print(f"  ⚠️  Groq API error: {e}")
+        print(f"  ⚠️  AI API error: {e}")
         return fallback
 
 
@@ -844,7 +917,8 @@ def main():
     sheet_name = f"SEO Audit {today}"
 
     print(f"\n🦴 SEO AUDIT + AI EXPERT — {audited_at}")
-    print(f"   Model    : {GROQ_MODEL}")
+    print(f"   Primary  : OpenRouter ({OPENROUTER_MODEL})")
+    print(f"   Fallback : Groq ({GROQ_MODEL})")
     print(f"   Websites : {WEBSITES}")
     print(f"   Sheet    : {sheet_name}\n")
 
